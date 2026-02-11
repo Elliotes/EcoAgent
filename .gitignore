@@ -44,25 +44,25 @@ ENV/
 config/gemini.env
 config/*.env
 
-# Data files (large files, keep structure but ignore content)
-data/*.csv
-data/**/*.csv
-data/*.jsonl
-data/**/*.jsonl
-data/*.json
-data/**/*.json
-data/*.npy
-data/**/*.npy
-data/*.model
-data/**/*.model
-data/**/*.joblib
-data/*.joblib
-data/*.png
-data/**/*.png
-data/*.txt
-data/**/*.txt
-data/*.pdf
-data/**/*.pdf
+# Data files: tracked with Git LFS (see .gitattributes); do not ignore
+# data/*.csv
+# data/**/*.csv
+# data/*.jsonl
+# data/**/*.jsonl
+# data/*.json
+# data/**/*.json
+# data/*.npy
+# data/**/*.npy
+# data/*.model
+# data/**/*.model
+# data/**/*.joblib
+# data/*.joblib
+# data/*.png
+# data/**/*.png
+# data/*.txt
+# data/**/*.txt
+# data/*.pdf
+# data/**/*.pdf
 !data/.gitkeep
 !data/README.md
 !data/DATA_SLIM.md
