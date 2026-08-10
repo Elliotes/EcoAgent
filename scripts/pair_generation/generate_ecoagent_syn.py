@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Generate EcoAgent-Syn dataset: use LLM to generate synthetic queries and build positive/negative pairs.
-Pipeline: (1) Gemini generates 10-20 diverse queries per tool; (2) quality filter (5-30 words, low Jaccard vs description);
+Pipeline: (1) Gemma-3-1b generates 10-20 diverse queries per tool; (2) quality filter (5-120 words, near-duplicate removal at Jaccard > 0.7);
 (3) negatives: hard semantic (SBERT), hard lexical (shared keywords), random; mix 70% hard + 30% random;
 (4) output: query, tool_slug, label, neg_type, split.
 Usage: python generate_ecoagent_syn.py
-Note: default tools path data/tools_20260116.jsonl or data/raw/; output ecoagent_syn_YYYYMMDD_HHMMSS.jsonl; API key from config/gemini.env if not set.
+Note: default tools path data/tools_20260116.jsonl or data/raw/; output ecoagent_syn_YYYYMMDD_HHMMSS.jsonl; the generator runs locally, so no API key is needed.
 """
 
 import argparse
@@ -26,39 +26,14 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
 try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    TRANSFORMERS_AVAILABLE = True
 except ImportError:
-    GEMINI_AVAILABLE = False
-    print("Warning: google.generativeai not available. Install with: pip install google-generativeai")
+    TRANSFORMERS_AVAILABLE = False
+    print("Warning: transformers not available. Install with: pip install transformers")
 
-
-def load_gemini_api_key_from_config():
-    config_path = Path(__file__).parent.parent.parent / "config" / "gemini.env"
-    if config_path.exists():
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        key, value = line.split("=", 1)
-                        if key.strip() == "GEMINI_API_KEY" and value.strip():
-                            os.environ["GEMINI_API_KEY"] = value.strip()
-                            return value.strip()
-        except Exception as e:
-            if os.environ.get("GEMINI_API_KEY"):
-                return os.environ.get("GEMINI_API_KEY")
-    return None
-
-
-FUNCTIONAL_KEYWORDS = {
-    "send", "email", "scrape", "webhook", "crm", "api", "request", "response",
-    "fetch", "download", "upload", "parse", "transform", "convert", "format",
-    "search", "query", "filter", "sort", "aggregate", "calculate", "compute",
-    "create", "update", "delete", "read", "write", "save", "load", "store",
-    "authenticate", "authorize", "validate", "verify", "check", "test",
-    "notify", "alert", "message", "chat", "post", "publish", "share"
-}
+DEFAULT_GEMMA_MODEL = "google/gemma-3-1b-it"
+_GEMMA_CACHE = {}
 
 
 def normalize_text(s: str) -> str:
@@ -95,29 +70,33 @@ def build_tool_description(tool: Dict) -> str:
     return ". ".join(parts)
 
 
-def generate_queries_with_gemini(
+def load_gemma(model_id: str = DEFAULT_GEMMA_MODEL):
+    """Load the local Gemma generator once and reuse it across tools."""
+    if model_id not in _GEMMA_CACHE:
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", device_map="auto")
+        model.eval()
+        _GEMMA_CACHE[model_id] = (tokenizer, model)
+    return _GEMMA_CACHE[model_id]
+
+
+def generate_queries_with_gemma(
     tool_name: str,
     tool_description: str,
     num_queries: int = 15,
-    api_key: str = None
+    model_id: str = DEFAULT_GEMMA_MODEL
 ) -> List[str]:
-    if not GEMINI_AVAILABLE:
-        raise ImportError("google.generativeai not available")
-    
-    if api_key:
-        genai.configure(api_key=api_key)
-    elif os.environ.get("GEMINI_API_KEY"):
-        genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-    else:
-        raise ValueError("Gemini API key not provided. Set GEMINI_API_KEY env var or use --gemini-api-key")
-    model_names = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+    if not TRANSFORMERS_AVAILABLE:
+        raise ImportError("transformers not available")
+
+    tokenizer, model = load_gemma(model_id)
     prompt = f"""You are generating diverse user queries for an AI agent tool recommendation system.
 
 Tool Name: {tool_name}
 Tool Description: {tool_description}
 
 Generate {num_queries} diverse, natural user queries that would lead to using this tool. Requirements:
-1. Each query should be 5-30 words
+1. Each query should be 5-120 words
 2. Vary the intent types: direct action requests, troubleshooting questions, how-to questions
 3. Use natural, conversational language
 4. DO NOT copy phrases verbatim from the tool description
@@ -125,52 +104,43 @@ Generate {num_queries} diverse, natural user queries that would lead to using th
 
 Output format: One query per line, no numbering or bullets."""
 
-    last_error = None
-    for model_name in model_names:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            queries = [q.strip() for q in response.text.strip().split('\n') if q.strip()]
-            queries = [re.sub(r'^[\d\-\.\)\s]+', '', q).strip() for q in queries]
-            queries = [q for q in queries if q and len(q) > 0]
-            return queries[:num_queries]
-        except Exception as e:
-            last_error = e
-            continue
     try:
-        available_models = list(genai.list_models())
-        for m in available_models:
-            if 'generateContent' in m.supported_generation_methods:
-                model_name = m.name.split("/")[-1]
-                try:
-                    model = genai.GenerativeModel(model_name)
-                    response = model.generate_content(prompt)
-                    queries = [q.strip() for q in response.text.strip().split('\n') if q.strip()]
-                    queries = [re.sub(r'^[\d\-\.\)\s]+', '', q).strip() for q in queries]
-                    queries = [q for q in queries if q and len(q) > 0]
-                    return queries[:num_queries]
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    print(f"Error generating queries for {tool_name}: {last_error}")
-    return []
+        inputs = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+            return_tensors="pt",
+        ).to(model.device)
+        outputs = model.generate(
+            inputs,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.9,
+            top_p=0.95,
+        )
+        text = tokenizer.decode(outputs[0][inputs.shape[-1]:], skip_special_tokens=True)
+    except Exception as e:
+        print(f"Error generating queries for {tool_name}: {e}")
+        return []
+
+    queries = [q.strip() for q in text.strip().split("\n") if q.strip()]
+    queries = [re.sub(r"^[\d\-\.\)\s]+", "", q).strip() for q in queries]
+    queries = [q for q in queries if q]
+    return queries[:num_queries]
 
 
-def filter_queries(queries: List[str], tool_description: str, min_words: int = 5, max_words: int = 30, max_jaccard: float = 0.5) -> List[str]:
+def filter_queries(queries: List[str], tool_description: str, min_words: int = 5, max_words: int = 120,
+                   max_jaccard: float = 0.5, dedup_jaccard: float = 0.7) -> List[str]:
     filtered = []
-    desc_normalized = normalize_text(tool_description)
     for q in queries:
-        q_normalized = normalize_text(q)
-        words = q_normalized.split()
+        words = normalize_text(q).split()
         if len(words) < min_words or len(words) > max_words:
             continue
-        jaccard = jaccard_similarity(q, tool_description)
-        if jaccard > max_jaccard:
+        if jaccard_similarity(q, tool_description) > max_jaccard:
             continue
-        
+        if any(jaccard_similarity(q, kept) > dedup_jaccard for kept in filtered):
+            continue
         filtered.append(q)
-    
+
     return filtered
 
 
@@ -258,8 +228,8 @@ def main():
                     help="Number of negative samples per positive pair (default: 2)")
     ap.add_argument("--hard-ratio", type=float, default=0.7,
                     help="Ratio of hard negatives (default: 0.7)")
-    ap.add_argument("--gemini-api-key", type=str, default=None,
-                    help="Gemini API key (or set GEMINI_API_KEY env var)")
+    ap.add_argument("--gemma-model", type=str, default=DEFAULT_GEMMA_MODEL,
+                    help=f"Local Gemma generator (default: {DEFAULT_GEMMA_MODEL})")
     ap.add_argument("--sbert-model", type=str, default="all-MiniLM-L6-v2",
                     help="SBERT model for semantic similarity (default: all-MiniLM-L6-v2)")
     ap.add_argument("--train-ratio", type=float, default=0.9,
@@ -277,7 +247,7 @@ def main():
     ap.add_argument("--tools", type=str, default=None,
                     help="Tools JSONL path; default data/tools_20260116.jsonl or data/raw/tools_20260116.jsonl")
     ap.add_argument("--progress-every", type=int, default=50,
-                    help="Print progress every N tools (default 50); 0=disable. Main cost: 1 Gemini call per tool.")
+                    help="Print progress every N tools (default 50); 0=disable. Main cost: 1 Gemma generation per tool.")
     args = ap.parse_args()
 
     if args.tools:
@@ -290,10 +260,6 @@ def main():
     if args.output_suffix and str(args.output_suffix).strip():
         fname += f"_{args.output_suffix.strip()}"
     output_file = (project_root / args.output_dir) / f"{fname}.jsonl"
-    if not args.gemini_api_key:
-        loaded_key = load_gemini_api_key_from_config()
-        if loaded_key:
-            args.gemini_api_key = loaded_key
     print(f"[1/5] Loading tools from {tools_file}...")
     tools = []
     with open(tools_file, "r", encoding="utf-8") as f:
@@ -355,9 +321,9 @@ def main():
             tool_slug = tool.get("slug") or tool.get("name", "").lower().replace(" ", "-")
             tool_name = tool.get("name", "")
             tool_desc = build_tool_description(tool)
-            queries = generate_queries_with_gemini(
+            queries = generate_queries_with_gemma(
                 tool_name, tool_desc, num_queries=args.queries_per_tool,
-                api_key=args.gemini_api_key
+                model_id=args.gemma_model
             )
             queries = filter_queries(queries, tool_desc)
             if not queries:
